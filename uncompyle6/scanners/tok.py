@@ -1,4 +1,4 @@
-#  Copyright (c) 2016-2018 by Rocky Bernstein
+#  Copyright (c) 2016-2020 by Rocky Bernstein
 #  Copyright (c) 2000-2002 by hartmut Goebel <h.goebel@crazy-compilers.com>
 #  Copyright (c) 1999 John Aycock
 #
@@ -21,24 +21,62 @@ from uncompyle6 import PYTHON3
 if PYTHON3:
     intern = sys.intern
 
-class Token():
+
+def off2int(offset, prefer_last=True):
+    if isinstance(offset, int):
+        return offset
+    else:
+        assert isinstance(offset, str)
+        offsets = list(map(int, offset.split("_")))
+        if len(offsets) == 1:
+            return offsets[0]
+        else:
+            assert len(offsets) == 2
+            offset_1, offset_2 = offsets
+        if offset_1 + 2 == offset_2:
+            # This is an instruction with an extended arg.
+            # For things that compare against offsets, we generally want the
+            # later offset.
+            return offset_2 if prefer_last else offset_1
+        else:
+            # Probably a "COME_FROM"-type offset, where the second number
+            # is just a count, and not really an offset.
+            return offset_1
+
+
+class Token:
     """
     Class representing a byte-code instruction.
 
     A byte-code token is equivalent to Python 3's dis.instruction or
     the contents of one line as output by dis.dis().
     """
+
     # FIXME: match Python 3.4's terms:
     #    linestart = starts_line
     #    attr = argval
     #    pattr = argrepr
-    def __init__(self, opname, attr=None, pattr=None, offset=-1,
-                 linestart=None, op=None, has_arg=None, opc=None):
+    def __init__(
+        self,
+        opname,
+        attr=None,
+        pattr=None,
+        offset=-1,
+        linestart=None,
+        op=None,
+        has_arg=None,
+        opc=None,
+        has_extended_arg=False,
+    ):
         self.kind = intern(opname)
         self.has_arg = has_arg
         self.attr = attr
         self.pattr = pattr
-        self.offset = offset
+        if has_extended_arg:
+            self.offset = "%d_%d" % (offset, offset + 2)
+        else:
+            self.offset = offset
+
         self.linestart = linestart
         if has_arg is False:
             self.attr = None
@@ -46,6 +84,7 @@ class Token():
 
         if opc is None:
             from xdis.std import _std_api
+
             self.opc = _std_api.opc
         else:
             self.opc = opc
@@ -58,7 +97,9 @@ class Token():
         """ '==' on kind and "pattr" attributes.
             It is okay if offsets and linestarts are different"""
         if isinstance(o, Token):
-            return (self.kind == o.kind) and (self.pattr == o.pattr)
+            return (self.kind == o.kind) and (
+                (self.pattr == o.pattr) or self.attr == o.attr
+            )
         else:
             # ?? do we need this?
             return self.kind == o
@@ -77,41 +118,74 @@ class Token():
     #             ('%9s  %-18s %r' % (self.offset, self.kind, pattr)))
 
     def __str__(self):
-        return self.format(line_prefix='')
+        return self.format(line_prefix="")
 
-    def format(self, line_prefix=''):
-        prefix = ('\n%s%4d  ' % (line_prefix, self.linestart)
-                  if self.linestart else (' ' * (6 + len(line_prefix))))
-        offset_opname = '%6s  %-17s' % (self.offset, self.kind)
+    def format(self, line_prefix="", token_num=None):
+        if token_num is not None:
+            prefix = (
+                "\n(%03d)%s L.%4d  " % (token_num, line_prefix, self.linestart)
+                if self.linestart
+                else ("(%03d)%s" % (token_num, " " * (9 + len(line_prefix))))
+            )
+        else:
+            prefix = (
+                "\n%s L.%4d  " % (line_prefix, self.linestart)
+                if self.linestart
+                else (" " * (9 + len(line_prefix)))
+            )
+        offset_opname = "%8s  %-17s" % (self.offset, self.kind)
+
         if not self.has_arg:
             return "%s%s" % (prefix, offset_opname)
-        argstr = "%6d " % self.attr if isinstance(self.attr, int) else (' '*7)
+        argstr = "%6d " % self.attr if isinstance(self.attr, int) else (" " * 7)
+        name = self.kind
+
         if self.has_arg:
             pattr = self.pattr
             if self.opc:
                 if self.op in self.opc.JREL_OPS:
-                    if not self.pattr.startswith('to '):
+                    if not self.pattr.startswith("to "):
                         pattr = "to " + self.pattr
                 elif self.op in self.opc.JABS_OPS:
                     self.pattr = str(self.pattr)
-                    if not self.pattr.startswith('to '):
+                    if not self.pattr.startswith("to "):
                         pattr = "to " + str(self.pattr)
                     pass
                 elif self.op in self.opc.CONST_OPS:
-                    # Compare with pysource n_LOAD_CONST
-                    attr = self.attr
-                    if attr is None:
-                        pattr = None
+                    if name == "LOAD_STR":
+                        pattr = self.attr
+                    elif name == "LOAD_CODE":
+                        return "%s%s%s %s" % (prefix, offset_opname, argstr, pattr)
+                    else:
+                        return "%s%s        %r" % (prefix, offset_opname, pattr)
+
                 elif self.op in self.opc.hascompare:
                     if isinstance(self.attr, int):
                         pattr = self.opc.cmp_op[self.attr]
+                    return "%s%s%s %s" % (prefix, offset_opname, argstr, pattr)
+                elif self.op in self.opc.hasvargs:
+                    return "%s%s%s" % (prefix, offset_opname, argstr)
+                elif name == "LOAD_ASSERT":
+                    return "%s%s        %s" % (prefix, offset_opname, pattr)
+                elif self.op in self.opc.NAME_OPS:
+                    if self.opc.version >= 3.0:
+                        return "%s%s%s %s" % (prefix, offset_opname, argstr, self.attr)
+                elif name == "EXTENDED_ARG":
+                    return "%s%s%s 0x%x << %s = %s" % (
+                        prefix,
+                        offset_opname,
+                        argstr,
+                        self.attr,
+                        self.opc.EXTENDED_ARG_SHIFT,
+                        pattr,
+                    )
                 # And so on. See xdis/bytecode.py get_instructions_bytes
                 pass
-        elif re.search(r'_\d+$', self.kind):
-            return "%s%s%s" % (prefix, offset_opname,  argstr)
+        elif re.search(r"_\d+$", self.kind):
+            return "%s%s%s" % (prefix, offset_opname, argstr)
         else:
-            pattr = ''
-        return "%s%s%s %r" % (prefix, offset_opname,  argstr, pattr)
+            pattr = ""
+        return "%s%s%s %r" % (prefix, offset_opname, argstr, pattr)
 
     def __hash__(self):
         return hash(self.kind)
@@ -119,4 +193,8 @@ class Token():
     def __getitem__(self, i):
         raise IndexError
 
-NoneToken = Token('LOAD_CONST', offset=-1, attr=None, pattr=None)
+    def off2int(self, prefer_last=True):
+        return off2int(self.offset, prefer_last)
+
+
+NoneToken = Token("LOAD_CONST", offset=-1, attr=None, pattr=None)
